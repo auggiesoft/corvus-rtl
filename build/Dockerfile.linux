@@ -1,0 +1,5 @@
+# Linux x86_64: librtlsdr as one shared library, against the system libusb (present on every desktop Linux).
+FROM ubuntu:24.04
+RUN (apt-get update -qq --error-on=any || { sed -i 's@http://\(archive\|security\)\.ubuntu\.com/ubuntu@http://mirrors.edge.kernel.org/ubuntu@g' /etc/apt/sources.list.d/ubuntu.sources && apt-get update -qq --error-on=any; }) \
+ && apt-get install -y --no-install-recommends build-essential pkg-config libusb-1.0-0-dev \
+ && rm -rf /var/lib/apt/lists/*
