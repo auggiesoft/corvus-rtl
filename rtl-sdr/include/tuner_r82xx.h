@@ -8,6 +8,9 @@
  * Linux kernel:
  * http://git.linuxtv.org/linux-2.6.git/history/HEAD:/drivers/media/tuners/r820t.c
  *
+ * Modified 2026 by Auggie for corvus-rtl: fewer USB control transfers per retune (see corvus-rtl's
+ * README, "Changes to librtlsdr").
+ *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation, either version 2 of the License, or
@@ -85,6 +88,10 @@ struct r82xx_priv {
 	uint8_t				input;
 	int				has_lock;
 	int				init_done;
+	/* corvus-rtl: VCO fine tune (register 0x04) from the last lock check, so the next tune
+	 * needn't read it again; valid only after a lock */
+	int				vco_ft_valid;
+	uint8_t				vco_ft_reg4;
 
 	/* Store current mode */
 	uint32_t			delsys;

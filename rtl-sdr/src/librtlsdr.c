@@ -3,6 +3,9 @@
  * Copyright (C) 2012-2014 by Steve Markgraf <steve@steve-m.de>
  * Copyright (C) 2012 by Dimitri Stolnikov <horiz0n@gmx.net>
  *
+ * Modified 2026 by Auggie for corvus-rtl: fewer USB control transfers per retune (see corvus-rtl's
+ * README, "Changes to librtlsdr").
+ *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation, either version 2 of the License, or
@@ -122,6 +125,8 @@ struct rtlsdr_dev {
 	char manufact[256];
 	char product[256];
 	int force_bt;
+	/* corvus-rtl: the I2C repeater state last written (demod page 1, reg 0x01), -1 unknown */
+	int i2c_repeater;
 	enum rtlsdr_ds_mode direct_sampling_mode;
 };
 
@@ -577,7 +582,13 @@ void rtlsdr_set_gpio_output(rtlsdr_dev_t *dev, uint8_t gpio)
 
 void rtlsdr_set_i2c_repeater(rtlsdr_dev_t *dev, int on)
 {
-	rtlsdr_demod_write_reg(dev, 1, 0x01, on ? 0x18 : 0x10, 1);
+	/* corvus-rtl: only when it changes; every retune asked for it again, and a demod write is two USB
+	 * control transfers (the write and a read-back) */
+	on = !!on;
+	if (dev->i2c_repeater == on)
+		return;
+
+	dev->i2c_repeater = rtlsdr_demod_write_reg(dev, 1, 0x01, on ? 0x18 : 0x10, 1) == 0 ? on : -1;
 }
 
 int rtlsdr_set_fir(rtlsdr_dev_t *dev)
@@ -629,6 +640,7 @@ void rtlsdr_init_baseband(rtlsdr_dev_t *dev)
 	/* reset demod (bit 3, soft_rst) */
 	rtlsdr_demod_write_reg(dev, 1, 0x01, 0x14, 1);
 	rtlsdr_demod_write_reg(dev, 1, 0x01, 0x10, 1);
+	dev->i2c_repeater = 0; /* corvus-rtl: 0x10 leaves it off */
 
 	/* disable spectrum inversion and adjacent channel rejection */
 	rtlsdr_demod_write_reg(dev, 1, 0x15, 0x00, 1);
@@ -1154,6 +1166,7 @@ int rtlsdr_set_sample_rate(rtlsdr_dev_t *dev, uint32_t samp_rate)
 	/* reset demod (bit 3, soft_rst) */
 	r |= rtlsdr_demod_write_reg(dev, 1, 0x01, 0x14, 1);
 	r |= rtlsdr_demod_write_reg(dev, 1, 0x01, 0x10, 1);
+	dev->i2c_repeater = r ? -1 : 0; /* corvus-rtl: 0x10 leaves it off */
 
 	/* recalculate offset frequency if offset tuning is enabled */
 	if (dev->offs_freq)
@@ -1509,6 +1522,7 @@ int rtlsdr_open(rtlsdr_dev_t **out_dev, uint32_t index)
 		return -ENOMEM;
 
 	memset(dev, 0, sizeof(rtlsdr_dev_t));
+	dev->i2c_repeater = -1;
 	memcpy(dev->fir, fir_default, sizeof(fir_default));
 
 	r = libusb_init(&dev->ctx);

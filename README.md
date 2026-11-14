@@ -12,7 +12,7 @@ what the dongles need lives here, under the licences of the code it's built from
 
 | File | What it is | Licence |
 |---|---|---|
-| `corvus-rtl-<v>-windows-x64.dll` | librtlsdr (the RTL-SDR Blog's fork, V1.4.0) with libusb 1.0.29 built in: one DLL, importing only `KERNEL32` and `msvcrt` | GPL-2.0-or-later |
+| `corvus-rtl-<v>-windows-x64.dll` | librtlsdr (the RTL-SDR Blog's fork, V1.4.0, with the [changes below](#changes-to-librtlsdr)) with libusb 1.0.29 built in: one DLL, importing only `KERNEL32` and `msvcrt` | GPL-2.0-or-later |
 | `libcorvus-rtl-<v>-linux-x86_64.so` | the same librtlsdr for Linux, against the system's `libusb-1.0.so.0`; detaches the DVB-T kernel driver when it opens a dongle | GPL-2.0-or-later |
 | `corvus-rtl-driver-<v>-windows-x64.exe` | Windows: gives the dongles Windows' own WinUSB driver (what Zadig does, without its window) | LGPL-3.0-or-later |
 | `SHA256SUMS` | checksums | |
@@ -45,6 +45,29 @@ such as the one in `rtl-sdr/rtl-sdr.rules` (copy it to `/etc/udev/rules.d/`, the
 distribution's `rtl-sdr` package, which installs it. The DVB-T kernel driver is detached when the dongle is
 opened; blacklisting `dvb_usb_rtl28xxu` keeps it away entirely.
 
+## Changes to librtlsdr
+
+Retuning is what a sweep spends its time on, and librtlsdr's retune was ~50 ms on an R820T: 22 USB control
+transfers of ~2.25 ms each (every register write to the tuner is an I2C transaction through the RTL2832U, one
+control transfer; a read is two). Since v0.2.0 (`src/tuner_r82xx.c`, `include/tuner_r82xx.h`,
+`src/librtlsdr.c`, each marked):
+
+- **Only changed registers are written while tuning.** `r82xx_set_mux`, `r82xx_set_vga_gain` and
+  `r82xx_set_pll` compare each value with the driver's shadow copy of the register first. A step of a few
+  MHz used to rewrite ~17 registers, most of them unchanged.
+- **The I2C repeater is switched only when its state changes.** Every retune switched it on again, a demod
+  write and its read-back. The demod soft resets, which leave it off, are tracked too.
+- **The VCO fine tune is kept from the last lock check** (which now reads 5 status bytes instead of 3)
+  instead of read again before the next tune. Over 5,374 tunes across 24–1766 MHz, both directions and random
+  jumps, a fresh read never differed from it.
+
+A retune is then 5 transfers: the PLL autotune speed up and back, the changed fraction, and the lock check.
+Measured on generic R820T dongles (RTL2838UHIDIR): 11.5 ms instead of 50.6, so a step at 2.4 MSPS (retune,
+buffer reset, settling, one block) takes ~19 ms instead of ~58, and Corvus Sweep's sweep runs ~51 steps/s
+instead of ~18. FM stations land on the same frequencies (within a few kHz) at the same levels, and the noise
+floor is unchanged. Nothing else in librtlsdr changes: other programs that use these files tune the same way,
+only faster.
+
 ## Building
 
 `build/build.sh [version]` builds everything in Docker (Fedora's MinGW-w64 for Windows, with libusb built
@@ -55,7 +78,7 @@ statically from its release tarball, checked against its published SHA-256; Ubun
 
 | Path | |
 |---|---|
-| `rtl-sdr/` | [rtlsdrblog/rtl-sdr-blog](https://github.com/rtlsdrblog/rtl-sdr-blog) V1.4.0 (aed0ea1), unmodified |
+| `rtl-sdr/` | [rtlsdrblog/rtl-sdr-blog](https://github.com/rtlsdrblog/rtl-sdr-blog) V1.4.0 (aed0ea1), imported unmodified, then the [changes below](#changes-to-librtlsdr) |
 | `libwdi/` | [pbatard/libwdi](https://github.com/pbatard/libwdi) v1.5.1 (9b23b82), unmodified; only `pki.c` and `logging.c` are built |
 | `driver/` | the WinUSB installer: `corvus-rtl-driver.c`, `wdi_glue.c` (what `pki.c` takes from the rest of libwdi), its manifest |
 | `build/` | `build.sh` and the two Dockerfiles |

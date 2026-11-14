@@ -8,6 +8,9 @@
  * Linux kernel:
  * http://git.linuxtv.org/linux-2.6.git/history/HEAD:/drivers/media/tuners/r820t.c
  *
+ * Modified 2026 by Auggie for corvus-rtl: fewer USB control transfers per retune (see corvus-rtl's
+ * README, "Changes to librtlsdr").
+ *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation, either version 2 of the License, or
@@ -318,6 +321,34 @@ static int r82xx_write_reg_mask(struct r82xx_priv *priv, uint8_t reg, uint8_t va
 	return r82xx_write(priv, reg, &val, 1);
 }
 
+/*
+ * corvus-rtl: the tuning path (r82xx_set_mux, r82xx_set_vga_gain, r82xx_set_pll) writes a register only when
+ * its shadow copy differs. Every write is an I2C transaction through the RTL2832U, one USB control transfer of
+ * ~2 ms, and a retune by a step of a few MHz used to rewrite ~17 registers that mostly already held the value.
+ */
+static int r82xx_write_reg_changed(struct r82xx_priv *priv, uint8_t reg, uint8_t val)
+{
+	if (r82xx_read_cache_reg(priv, reg) == val)
+		return 0;
+
+	return r82xx_write(priv, reg, &val, 1);
+}
+
+static int r82xx_write_reg_mask_changed(struct r82xx_priv *priv, uint8_t reg, uint8_t val,
+					uint8_t bit_mask)
+{
+	int rc = r82xx_read_cache_reg(priv, reg);
+
+	if (rc < 0)
+		return rc;
+
+	val = (rc & ~bit_mask) | (val & bit_mask);
+	if (val == rc)
+		return 0;
+
+	return r82xx_write(priv, reg, &val, 1);
+}
+
 static uint8_t r82xx_bitrev(uint8_t byte)
 {
 	const uint8_t lut[16] = { 0x0, 0x8, 0x4, 0xc, 0x2, 0xa, 0x6, 0xe,
@@ -380,17 +411,17 @@ static int r82xx_set_mux(struct r82xx_priv *priv, uint32_t freq)
 	range = &freq_ranges[i];
 
 	/* Open Drain */
-	rc = r82xx_write_reg_mask(priv, 0x17, range->open_d, 0x08);
+	rc = r82xx_write_reg_mask_changed(priv, 0x17, range->open_d, 0x08);
 	if (rc < 0)
 		return rc;
 
 	/* RF_MUX,Polymux */
-	rc = r82xx_write_reg_mask(priv, 0x1a, range->rf_mux_ploy, 0xc3);
+	rc = r82xx_write_reg_mask_changed(priv, 0x1a, range->rf_mux_ploy, 0xc3);
 	if (rc < 0)
 		return rc;
 
 	/* TF BAND */
-	rc = r82xx_write_reg(priv, 0x1b, range->tf_c);
+	rc = r82xx_write_reg_changed(priv, 0x1b, range->tf_c);
 	if (rc < 0)
 		return rc;
 
@@ -411,15 +442,15 @@ static int r82xx_set_mux(struct r82xx_priv *priv, uint32_t freq)
 		val = range->xtal_cap0p | 0x08;
 		break;
 	}
-	rc = r82xx_write_reg_mask(priv, 0x10, val, 0x0b);
+	rc = r82xx_write_reg_mask_changed(priv, 0x10, val, 0x0b);
 	if (rc < 0)
 		return rc;
 
-	rc = r82xx_write_reg_mask(priv, 0x08, 0x00, 0x3f);
+	rc = r82xx_write_reg_mask_changed(priv, 0x08, 0x00, 0x3f);
 	if (rc < 0)
 		return rc;
 
-	rc = r82xx_write_reg_mask(priv, 0x09, 0x00, 0x3f);
+	rc = r82xx_write_reg_mask_changed(priv, 0x09, 0x00, 0x3f);
 
 	return rc;
 }
@@ -448,20 +479,20 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 	pll_ref = priv->cfg->xtal;
 	pll_ref_khz = (priv->cfg->xtal + 500) / 1000;
 
-	rc = r82xx_write_reg_mask(priv, 0x10, refdiv2, 0x10);
+	rc = r82xx_write_reg_mask_changed(priv, 0x10, refdiv2, 0x10);
 	if (rc < 0)
 		return rc;
 
 	/* set pll autotune = 128kHz */
-	rc = r82xx_write_reg_mask(priv, 0x1a, 0x00, 0x0c);
+	rc = r82xx_write_reg_mask_changed(priv, 0x1a, 0x00, 0x0c);
 	if (rc < 0)
 		return rc;
 
 	/* set VCO current = 100 */
-	/* rc = r82xx_write_reg_mask(priv, 0x12, 0x80, 0xe0); */
+	/* rc = r82xx_write_reg_mask_changed(priv, 0x12, 0x80, 0xe0); */
 
 	/* RTL-SDR Blog Modification: Set VCO current to MAX */
-	rc = r82xx_write_reg_mask(priv, 0x12, 0x06, 0xff);
+	rc = r82xx_write_reg_mask_changed(priv, 0x12, 0x06, 0xff);
 	if (rc < 0)
 		return rc;
 
@@ -479,9 +510,15 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 		mix_div = mix_div << 1;
 	}
 
-	rc = r82xx_read(priv, 0x00, data, sizeof(data));
-	if (rc < 0)
-		return rc;
+	/* corvus-rtl: the VCO fine tune the last lock check read, instead of reading it again (over 5,374
+	 * tunes across 24-1766 MHz, a fresh read never differed from it) */
+	if (priv->vco_ft_valid) {
+		data[4] = priv->vco_ft_reg4;
+	} else {
+		rc = r82xx_read(priv, 0x00, data, sizeof(data));
+		if (rc < 0)
+			return rc;
+	}
 
 	if (priv->cfg->rafael_chip == CHIP_R828D || rtlsdr_check_dongle_model(priv->rtl_dev, "RTLSDRBlog", "Blog V4L"))
 		vco_power_ref = 1;
@@ -493,7 +530,7 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 	else if (vco_fine_tune < vco_power_ref)
 		div_num = div_num + 1;
 
-	rc = r82xx_write_reg_mask(priv, 0x10, div_num << 5, 0xe0);
+	rc = r82xx_write_reg_mask_changed(priv, 0x10, div_num << 5, 0xe0);
 	if (rc < 0)
 		return rc;
 
@@ -509,7 +546,7 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 	ni = (nint - 13) / 4;
 	si = nint - 4 * ni - 13;
 
-	rc = r82xx_write_reg(priv, 0x14, ni + (si << 6));
+	rc = r82xx_write_reg_changed(priv, 0x14, ni + (si << 6));
 	if (rc < 0)
 		return rc;
 
@@ -519,7 +556,7 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 	else
 		val = 0x00;
 
-	rc = r82xx_write_reg_mask(priv, 0x12, val, 0x08);
+	rc = r82xx_write_reg_mask_changed(priv, 0x12, val, 0x08);
 	if (rc < 0)
 		return rc;
 
@@ -534,18 +571,18 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 		n_sdm <<= 1;
 	}
 
-	rc = r82xx_write_reg(priv, 0x16, sdm >> 8);
+	rc = r82xx_write_reg_changed(priv, 0x16, sdm >> 8);
 	if (rc < 0)
 		return rc;
-	rc = r82xx_write_reg(priv, 0x15, sdm & 0xff);
+	rc = r82xx_write_reg_changed(priv, 0x15, sdm & 0xff);
 	if (rc < 0)
 		return rc;
 
 	for (i = 0; i < 2; i++) {
 //		usleep_range(sleep_time, sleep_time + 1000);
 
-		/* Check if PLL has locked */
-		rc = r82xx_read(priv, 0x00, data, 3);
+		/* Check if PLL has locked (corvus-rtl: 5 bytes, keeping the VCO fine tune for the next tune) */
+		rc = r82xx_read(priv, 0x00, data, 5);
 		if (rc < 0)
 			return rc;
 		if (data[2] & 0x40)
@@ -553,9 +590,9 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 
 		if (!i) {
 			/* Didn't lock. Increase VCO current */
-			/* rc = r82xx_write_reg_mask(priv, 0x12, 0x60, 0xe0); */
+			/* rc = r82xx_write_reg_mask_changed(priv, 0x12, 0x60, 0xe0); */
 			/* RTL-SDR Blog Hack: Set max current */
-			rc = r82xx_write_reg_mask(priv, 0x12, 0x06, 0xff);
+			rc = r82xx_write_reg_mask_changed(priv, 0x12, 0x06, 0xff);
 			if (rc < 0)
 				return rc;
 		}
@@ -564,13 +601,16 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 	if (!(data[2] & 0x40)) {
 		fprintf(stderr, "[R82XX] PLL not locked!\n");
 		priv->has_lock = 0;
+		priv->vco_ft_valid = 0;
 		return 0;
 	}
 
 	priv->has_lock = 1;
+	priv->vco_ft_reg4 = data[4];
+	priv->vco_ft_valid = 1;
 
 	/* set pll autotune = 8kHz */
-	rc = r82xx_write_reg_mask(priv, 0x1a, 0x08, 0x08);
+	rc = r82xx_write_reg_mask_changed(priv, 0x1a, 0x08, 0x08);
 
 	return rc;
 }
@@ -1040,16 +1080,16 @@ int r82xx_set_vga_gain(struct r82xx_priv *priv) {
 	/* Disable for now. While it improves performance in some applications
 	   it appears to severely degrade performance in others */
 	/*if (priv->rf_freq > MHZ(1350)) {
-		rc = r82xx_write_reg_mask(priv, 0x0c, 0x0f, 0x9f); // Max 40.5 dB
+		rc = r82xx_write_reg_mask_changed(priv, 0x0c, 0x0f, 0x9f); // Max 40.5 dB
 	}
 	else if (priv->rf_freq > MHZ(1000)) {
-		rc = r82xx_write_reg_mask(priv, 0x0c, 0x0b, 0x9f);
+		rc = r82xx_write_reg_mask_changed(priv, 0x0c, 0x0b, 0x9f);
 	}
 	else {
-		rc = r82xx_write_reg_mask(priv, 0x0c, 0x08, 0x9f); // 16.3 dB
+		rc = r82xx_write_reg_mask_changed(priv, 0x0c, 0x08, 0x9f); // 16.3 dB
 	}*/
 
-	rc = r82xx_write_reg_mask(priv, 0x0c, 0x08, 0x9f); // 16.3 dB
+	rc = r82xx_write_reg_mask_changed(priv, 0x0c, 0x08, 0x9f); // 16.3 dB
 
 	return rc;
 }
